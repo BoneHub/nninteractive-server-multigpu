@@ -1,36 +1,49 @@
 # nnInteractive server on multiple GPUs
 
 Run the official [nnInteractive](https://github.com/MIC-DKFZ/nnInteractive) server on a
-machine with several NVIDIA GPUs, so that all users connect to **one port with one API key**.
+machine with several NVIDIA GPUs. All users connect to **one port**, each with **their own
+API key**, and the key decides which GPU serves the user.
 
 One nnInteractive server container uses one GPU, even when it is started with
 `--gpus all`. This project runs one server container per GPU and puts an nginx reverse
-proxy in front of them. There are no scripts: you edit two config files by hand and run
+proxy in front of them. You list the users' keys per GPU in `.env` and run
 `docker compose up -d`, on Linux or on Windows (Docker Desktop with the WSL2 backend).
 
 ```text
-                                  +--> nn0: nnInteractive server on GPU 0
-users --> port 1527 --> proxy ----+
-          (one API key) (nginx)   +--> nn1: nnInteractive server on GPU 1
+user with key A --+                                  +--> nn0: server on GPU 0   GPU0_USER_KEYS=A,B
+user with key B --+                                  |
+                  +--> port 1527 --> proxy (nginx) --+
+user with key C --+                                  |
+user with key D --+                                  +--> nn1: server on GPU 1   GPU1_USER_KEYS=C,D
 ```
 
 | File | Purpose |
 |---|---|
+| `.env.example` | Settings template with the users' keys per GPU. Copy it to `.env` and fill in the keys. |
 | `compose.yaml` | One service per GPU (`nn0`, `nn1`, ...) plus the `proxy`. Preconfigured for GPUs 0 and 1. |
-| `nginx.conf` | Proxy configuration. Lists the same GPU services. |
-| `.env.example` | Settings template. Copy it to `.env` and set the API key. |
+| `nginx.conf` | Proxy configuration. |
+| `proxy-start.sh` | Runs when the proxy starts: checks the keys in `.env` and hands them to nginx. |
+| `gpu-start.sh` | Runs when a GPU container starts: sets its `--max-sessions` to its number of users. |
+
+You never run the two scripts yourself.
 
 ## How it works
 
 - Each GPU service runs the official image `ghcr.io/mic-dkfz/nninteractive-server`,
   pinned to one GPU. These containers publish no ports; only the proxy can reach them.
 - The proxy is the only thing users connect to (port 1527 by default).
-- A user's session (uploaded image, prompts, segmentation) lives in the memory of the GPU
-  container that created it, so every request from that user must reach the same
-  container. nginx picks the container from the user's IP address
-  (`hash $remote_addr consistent`): a user always lands on the same GPU, and when you add
-  or remove a GPU, most users keep theirs.
-- All GPU containers use the same API key from `.env`.
+- `.env` gives every user a key and a GPU: `GPU0_USER_KEYS` lists the keys of the users of
+  GPU 0, `GPU1_USER_KEYS` those of GPU 1, and so on.
+- The client sends the key with every request. The proxy passes each request to the GPU
+  container of its key and answers `401` to an unknown key. A user's session (uploaded
+  image, prompts, segmentation) lives in the memory of that container, and since the user
+  always reaches the same container, the session keeps working. The IP address plays no
+  part: users who share one (NAT router, VPN, remote desktop server, Docker Desktop) still
+  reach their own GPU.
+- The proxy replaces the user's key with `INTERNAL_API_KEY` before passing a request on.
+  The GPU containers accept only that key; users never see it.
+- A GPU container serves one session per user at a time: its `--max-sessions` is the
+  number of keys in its line in `.env`.
 
 ## Requirements
 
@@ -41,8 +54,8 @@ users --> port 1527 --> proxy ----+
   configured for Docker (`sudo nvidia-ctk runtime configure --runtime=docker`, then
   restart Docker).
 - **Windows:** [Docker Desktop with GPU support](https://docs.docker.com/desktop/features/gpu/)
-  (WSL2 backend). Read the [Windows notes](#windows-notes) first: two Docker Desktop
-  limitations affect this setup.
+  (WSL2 backend). Read the [Windows notes](#windows-notes) first: a Docker Desktop
+  limitation can affect this setup.
 - Several GB of disk space for the server image.
 
 Check that Docker can use your GPUs (this lists them):
@@ -66,8 +79,19 @@ docker run --rm --gpus all ubuntu nvidia-smi -L
    cp .env.example .env
    ```
 
-   Open `.env` and set `NN_INTERACTIVE_API_KEY` to a long random value of letters and
-   digits, for example the output of `openssl rand -hex 32`.
+   Open `.env` and fill in the keys: `INTERNAL_API_KEY`, and the keys of the users of GPU 0
+   and GPU 1, separated by commas. Make every key with `openssl rand -hex 16`, a new value
+   for each:
+
+   ```
+   INTERNAL_API_KEY=<key>
+   # GPU 0: Alice, Bob
+   GPU0_USER_KEYS=<Alice's key>,<Bob's key>
+   # GPU 1: Carol, Dave
+   GPU1_USER_KEYS=<Carol's key>,<Dave's key>
+   ```
+
+   The comment lines are optional; they help to remember whose key is whose.
 
 3. Check your GPU numbers with `nvidia-smi -L`. `compose.yaml` uses GPUs 0 and 1; to use
    other GPUs, first [choose the GPUs](#choose-the-gpus).
@@ -88,15 +112,23 @@ docker run --rm --gpus all ubuntu nvidia-smi -L
 
    Ctrl+C stops following the logs; the servers keep running.
 
-6. Check the proxy: on the server, open <http://127.0.0.1:1527/healthz>. It shows
-   `{"ok":true}`.
+6. Check the proxy. `docker compose logs proxy` shows how many user keys each GPU has.
+   Then send a request with one user's key (in Windows PowerShell, type `curl.exe`
+   instead of `curl`):
+
+   ```
+   curl -H "Authorization: Bearer <a user's key>" http://127.0.0.1:1527/healthz
+   ```
+
+   It shows `{"ok":true}` when that user's GPU container is ready. Without a key,
+   `/healthz` only shows that the proxy is running.
 
 ## Connect a client
 
-Give your users:
+Give each user:
 
 - **Server URL:** `http://<server name or IP>:1527`
-- **API key:** the value of `NN_INTERACTIVE_API_KEY`
+- **API key:** their own key from `.env`
 
 Clients need no changes: to them the proxy is one ordinary nnInteractive server. The
 upstream [README](https://github.com/MIC-DKFZ/nnInteractive) and
@@ -108,22 +140,48 @@ from nnInteractive.inference.remote import nnInteractiveRemoteInferenceSession
 
 session = nnInteractiveRemoteInferenceSession(
     server_url="http://gpu-server:1527",
-    api_key="<the API key>",
+    api_key="<the user's key>",
 )
 ```
+
+## Manage users
+
+The users of a GPU are the keys in its line in `.env`.
+
+- **Add a user:** make a new key (`openssl rand -hex 16`) and add it to the line of the
+  GPU the user should work on.
+- **Remove a user:** delete their key. The proxy then rejects it.
+- **Move a user to another GPU:** move their key to that GPU's line.
+- **Give a user a new key:** replace their old key.
+
+Then apply the change:
+
+```
+docker compose up -d
+```
+
+This restarts the proxy, and every GPU container whose line changed, because its
+`--max-sessions` changes with it. A restarted GPU container ends its users' open sessions
+and needs a few minutes to load the model again; the other GPU containers keep running,
+and so do their users' sessions. Requests that are running while the proxy restarts
+fail and have to be repeated.
 
 ## Choose the GPUs
 
 GPU numbers are the ones `nvidia-smi -L` shows. Each GPU needs a service `nn<number>` in
-`compose.yaml` and a `server` line with the same name in `nginx.conf`.
+`compose.yaml` and a line `GPU<number>_USER_KEYS` in `.env`.
 
 To add a GPU, for example GPU 2:
 
-1. In `compose.yaml`, copy the `nn1` block, rename it to `nn2` and change `device_ids`:
+1. In `compose.yaml`, copy the `nn1` block, rename it to `nn2` and change its other two
+   1s to 2:
 
    ```yaml
      nn2:
        <<: *nninteractive
+       environment:
+         <<: *nninteractive-env
+         USER_KEYS: ${GPU2_USER_KEYS:?Set GPU2_USER_KEYS in .env}
        deploy:
          resources:
            reservations:
@@ -133,38 +191,24 @@ To add a GPU, for example GPU 2:
                  capabilities: [gpu]
    ```
 
-2. In `compose.yaml`, add `nn2` to `depends_on` of the `proxy` service:
+2. In `.env`, add a line with the keys of the users of GPU 2 (new users, or keys moved
+   from another GPU's line):
 
-   ```yaml
-       depends_on:
-         nn0: { condition: service_started, restart: true }
-         nn1: { condition: service_started, restart: true }
-         nn2: { condition: service_started, restart: true }
+   ```
+   GPU2_USER_KEYS=<key>,<key>
    ```
 
-3. In `nginx.conf`, add a line to the `upstream` block:
-
-   ```nginx
-           server nn2:1527;
-   ```
-
-4. Apply the change. `up -d` starts the new container. The proxy reads `nginx.conf` only
-   when it starts, so restart it:
+3. Apply the change:
 
    ```
    docker compose up -d
-   docker compose restart proxy
    ```
 
-Some users now move to the new GPU (about one in three when going from two to three
-GPUs); their open session ends and their client has to reconnect. All other users keep
-their GPU.
-
-To remove a GPU, delete it in the same three places and run:
+To remove a GPU, delete its block in `compose.yaml` and its line in `.env`, and move the
+keys of its users to another GPU's line (or they can no longer connect). Then run:
 
 ```
 docker compose up -d --remove-orphans
-docker compose restart proxy
 ```
 
 ## Settings
@@ -173,9 +217,14 @@ The settings live in `.env`; changes take effect with `docker compose up -d`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NN_INTERACTIVE_API_KEY` | none, required | The API key all users enter. Compose refuses to start without it. |
+| `INTERNAL_API_KEY` | none, required | The key the proxy uses for the GPU containers. Users never see or need it. |
+| `GPU<number>_USER_KEYS` | none, required for each GPU service | The keys of the users of that GPU, separated by commas. Also that GPU's `--max-sessions`: one session per key. |
 | `PUBLIC_PORT` | `1527` | Port users connect to. `127.0.0.1:1527` accepts connections from this machine only. |
 | `NN_IMAGE` | `ghcr.io/mic-dkfz/nninteractive-server:latest` | Server image. Pin a version tag for reproducible deployments; the tags are listed in the upstream [DOCKER.md](https://github.com/MIC-DKFZ/nnInteractive/blob/master/nnInteractive/inference/server/DOCKER.md). |
+
+Every key is 16 to 128 letters and digits, and no two keys are the same (upper and lower
+case count as the same). `openssl rand -hex 16` makes such a key. The proxy does not
+start while a key breaks these rules; see [Troubleshooting](#troubleshooting).
 
 ### Server options
 
@@ -184,17 +233,34 @@ Options for the nnInteractive server go on the `command:` line in the shared blo
 options apply to every GPU container:
 
 ```yaml
-  command: ["--max-sessions", "4"]
+  command: ["--idle-timeout-seconds", "1800"]
 ```
 
-- `--max-sessions`: how many users one GPU container serves at the same time (default 3).
-  The next user gets "server is at capacity". Predictions on one GPU run one after
-  another, so more users per GPU means more waiting and more memory; upstream recommends
-  adding GPUs over raising this number.
 - `--idle-timeout-seconds`: close a user's session after this much inactivity
   (default 600).
+- `--max-sessions`: how many sessions one GPU container serves at the same time.
+  `gpu-start.sh` sets it to the number of keys of the GPU; a `--max-sessions` on the
+  `command:` line replaces that number. For example, to let each of the two users of
+  GPU 0 open a second session, add `command: ["--max-sessions", "4"]` to the `nn0`
+  service. A `command:` in a service replaces the shared one, so repeat any shared
+  options there.
 
 `docker compose run --rm nn0 --help` lists all options.
+
+## Sessions
+
+- Each user has one session slot on their GPU. A user who opens a second session at the
+  same time (a second viewer window, or a script next to the viewer) takes the slot of
+  another user of that GPU, who then gets "server is at capacity".
+- A session ends when the client closes it, after 10 minutes without user actions
+  (`--idle-timeout-seconds`), or about a minute after the client stopped (crash, lost
+  network). Until then it keeps its slot: after a crash, a user may have to wait up to a
+  minute before they can connect again, if the GPU's other users are all connected.
+- Predictions on one GPU run one after another, so users of the same GPU wait for each
+  other. Put users who work at the same time on different GPUs.
+- If a GPU container is down, its users get `502` until Docker has restarted it and the
+  model is loaded; users of the other GPUs are not affected. Users are not moved to
+  another GPU: there they would take the slots of that GPU's users.
 
 ## Everyday commands
 
@@ -204,56 +270,43 @@ Run them in the project folder.
 |---|---|
 | Show status | `docker compose ps` |
 | Follow the logs | `docker compose logs -f` (one service: `docker compose logs -f nn1`) |
+| Add, remove or move a user | Edit `.env`, then `docker compose up -d` (see [Manage users](#manage-users)) |
 | Update the server image | `docker compose pull`, then `docker compose up -d` |
 | Stop everything | `docker compose down` |
 | Start again | `docker compose up -d` |
 
-- Updating the image, changing the API key or restarting a GPU container ends the open
-  sessions on that container. Users reconnect in their client.
-- To change the API key, edit `.env`, run `docker compose up -d` and give users the new key.
+- Updating the image, changing `INTERNAL_API_KEY` or restarting a GPU container ends the
+  open sessions on that container. Users reconnect in their client.
 - The containers restart by themselves after a crash or a reboot, as long as Docker
   starts at boot (Docker Desktop: turn on "Start Docker Desktop when you sign in").
 
-To see which user is on which GPU, look at the proxy log. It shows every request as
-`client address -> container address`:
+To see who works on which GPU, look at the proxy log:
 
 ```
 docker compose logs proxy
 ```
 
-This lists the address of each container:
+It shows every request with the client address, the user and the address of the GPU
+container that served it:
 
 ```
-docker inspect -f "{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $(docker compose ps -q)
+172.18.0.1 gpu0-user2 -> 172.18.0.3:1527 [27/Sep/2026:10:15:02 +0000] "POST /add_point_interaction HTTP/1.1" 200 5123 0.412s
 ```
 
-## How users are spread over the GPUs
-
-Users are assigned to GPUs by IP address, not by load. This keeps sessions working
-without any change to the clients, but:
-
-- Users who share an IP address (same computer, NAT router, VPN gateway, remote desktop
-  server) always share a GPU.
-- The spread is roughly even but not balanced: one GPU can be full while another is idle.
-  A user sent to a full container gets "server is at capacity", even if another GPU is
-  free. Raise `--max-sessions` if memory allows, or add GPUs.
-- If a GPU container is down, its users are sent to another one within a few seconds,
-  and back when it returns. Each move ends the user's open session.
-- nginx has to see the users' real IP addresses. Docker Engine on Linux passes them
-  through for IPv4 connections from other machines. Connections from the server itself,
-  IPv6 connections, and every connection on Docker Desktop (see
-  [Windows notes](#windows-notes)) can instead arrive with one internal Docker address.
-  Check `docker compose logs proxy`: if every line starts with the same address (such as
-  `172.18.0.1`), all users are on one GPU.
+`gpu0-user2` is the second key in `GPU0_USER_KEYS`. A request with an unknown key shows
+`- -> -` and status `401`.
 
 ## Security
 
-- The API key is the only access control. Anyone who has it and can reach the port can
-  use the GPUs.
-- Traffic is plain HTTP, so the key and the images cross the network unencrypted. Run
+- Every user has their own key. The proxy rejects requests with any other key (`401`)
+  before they reach a GPU container. To lock a user out, delete their key from `.env`
+  and run `docker compose up -d`.
+- The GPU containers accept only `INTERNAL_API_KEY`, which only the proxy sends. They
+  publish no ports, so only the internal Docker network can reach them.
+- Traffic is plain HTTP, so the keys and the images cross the network unencrypted. Run
   the server on a trusted network or VPN, or turn on HTTPS (below).
-- Only the proxy port is published; the GPU containers are reachable only on the
-  internal Docker network.
+- `/healthz` answers without a key, as on the nnInteractive server itself. It shows only
+  that the service is running.
 - Keep `.env` private. Git ignores it.
 
 ### Optional: HTTPS
@@ -266,6 +319,7 @@ in a `certs` folder next to `compose.yaml` (git ignores it), then:
    ```yaml
        volumes:
          - ./nginx.conf:/etc/nginx/nginx.conf:ro
+         - ./proxy-start.sh:/proxy-start.sh:ro
          - ./certs:/etc/nginx/certs:ro
    ```
 
@@ -282,10 +336,10 @@ in a `certs` folder next to `compose.yaml` (git ignores it), then:
 
 ## Windows notes
 
-The stack runs on Docker Desktop with the WSL2 backend, but two Docker Desktop
-limitations affect it. Neither applies on Linux.
+The stack runs on Docker Desktop with the WSL2 backend. One Docker Desktop limitation
+can require a change; it does not apply on Linux.
 
-**1. Each GPU container may see all GPUs.** NVIDIA documents that under WSL2 a container
+**Each GPU container may see all GPUs.** NVIDIA documents that under WSL2 a container
 cannot be limited to chosen GPUs
 ([CUDA on WSL, known limitations](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)).
 `device_ids` then has no effect, and every GPU container computes on the first GPU.
@@ -295,14 +349,16 @@ Check after starting:
 docker compose exec nn1 nvidia-smi -L
 ```
 
-If this lists more than one GPU, give every GPU service a `CUDA_VISIBLE_DEVICES` with
-its own GPU number (the same number as in `device_ids`). For example, `nn1` becomes:
+If this lists more than one GPU, add `CUDA_VISIBLE_DEVICES` with its own GPU number (the
+same number as in `device_ids`) to the `environment:` of every GPU service. For example,
+`nn1` becomes:
 
 ```yaml
   nn1:
     <<: *nninteractive
     environment:
       <<: *nninteractive-env
+      USER_KEYS: ${GPU1_USER_KEYS:?Set GPU1_USER_KEYS in .env}
       CUDA_VISIBLE_DEVICES: "1"
     deploy:
       resources:
@@ -320,11 +376,9 @@ memory in use. Only make this change where the check lists all GPUs. On Linux ea
 container sees just its own GPU (as number 0), and `CUDA_VISIBLE_DEVICES: "1"` would
 hide it.
 
-**2. nginx cannot see the users' IP addresses.** Docker Desktop relays published ports
-through its own process, so nginx sees every user with the same internal address, for
-example `172.19.0.1`. All users then land on the same GPU container while the other GPUs
-stay idle. Check with `docker compose logs proxy`. No configuration change fixes this; to
-spread users over the GPUs, run the stack on Linux.
+The proxy log shows the same client address for every user, for example `172.19.0.1`:
+Docker Desktop relays published ports through its own process. This does not matter:
+the proxy picks the GPU by key, not by address.
 
 If <http://localhost:1527> does not answer on the Windows machine itself, use
 <http://127.0.0.1:1527>.
@@ -333,15 +387,15 @@ If <http://localhost:1527> does not answer on the Windows machine itself, use
 
 | Symptom | Cause and fix |
 |---|---|
-| `required variable NN_INTERACTIVE_API_KEY is missing a value` | `.env` is missing, not next to `compose.yaml`, or the key in it is empty. |
+| `required variable INTERNAL_API_KEY is missing a value` (or `GPU0_USER_KEYS`, ...) | `.env` is missing, not next to `compose.yaml`, or that line in it is empty. Every GPU service in `compose.yaml` needs its `GPU<number>_USER_KEYS` line. |
+| The proxy keeps restarting, and `docker compose logs proxy` shows a `proxy-start.sh:` message | A key in `.env` breaks the rules (see [Settings](#settings)); the message names the key. Fix `.env`, then run `docker compose up -d`. |
 | `could not select device driver "nvidia" with capabilities: [[gpu]]` | Docker cannot use the GPUs. Linux: install and configure the NVIDIA Container Toolkit. Windows: turn on GPU support in Docker Desktop and update the NVIDIA driver. |
 | `nvidia-container-cli: device error: 1: unknown device` | `compose.yaml` uses a GPU number that does not exist. Compare with `nvidia-smi -L`. |
-| The proxy keeps restarting and its log says `host not found in upstream "nn2:1527"` | `nginx.conf` lists a service that is not in `compose.yaml` or not running. Make both files list the same GPUs, then run `docker compose restart proxy`. |
-| `502 Bad Gateway` | The GPU container is still starting (wait for `serving on` in its log) or has crashed (`docker compose logs nn0`). If it restarted by itself and the 502s continue, run `docker compose restart proxy`. |
-| `401`, "Invalid bearer token" | The client uses a different API key than `.env`. |
-| `503`, "server is at capacity" | The user's GPU container is full; see [How users are spread over the GPUs](#how-users-are-spread-over-the-gpus). |
-| `410`, "lease expired or unknown", "session expired" | The session was closed after inactivity, or the user was moved to another container (container restart, GPU added or removed, the user's IP address changed). Reconnect in the client. |
-| A new GPU gets no users | `nginx.conf` was not updated, or the proxy was not restarted. |
+| `401`, "Missing bearer token" | The client sends no key. Enter the user's key in the client. |
+| `401`, "Invalid bearer token" | The key is not in `.env` (a typo?), or `.env` was changed without running `docker compose up -d` afterwards. |
+| `502 Bad Gateway` | The user's GPU container is still starting (wait for `serving on` in its log) or has crashed (`docker compose logs nn0`). If the proxy log says `nn2 could not be resolved`, `.env` has a `GPU2_USER_KEYS` line but `compose.yaml` has no running `nn2` service. |
+| `503`, "server is at capacity" | All session slots of the user's GPU are taken; see [Sessions](#sessions). |
+| `410`, "lease expired or unknown", "session expired" | The session was closed after inactivity, or the user's GPU container restarted (image update, the GPU's line in `.env` changed), or the user's key moved to another GPU. Reconnect in the client. |
 
 ## License
 
