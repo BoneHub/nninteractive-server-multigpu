@@ -16,7 +16,13 @@ check_key() {  # <which key> <value>
         '') fail "$1 is empty" ;;
         *[!A-Za-z0-9]*) fail "$1 may contain only letters and digits" ;;
     esac
-    [ "${#2}" -ge 16 ] || fail "$1 is shorter than 16 characters"
+    # There is no minimum length. Warning: the key is the only thing that keeps
+    # others off the GPUs, and a short key (e.g. "alice" or "1234") is easy to
+    # guess by anyone who can reach PUBLIC_PORT. Use short keys only when the
+    # port is reachable from trusted machines alone; otherwise use random keys
+    # of 16 or more characters (openssl rand -hex 16). To enforce that, remove
+    # the # in front of the next line.
+    # [ "${#2}" -ge 16 ] || fail "$1 is shorter than 16 characters"
     [ "${#2}" -le 128 ] || fail "$1 is longer than 128 characters"
 }
 

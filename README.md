@@ -222,9 +222,15 @@ The settings live in `.env`; changes take effect with `docker compose up -d`.
 | `PUBLIC_PORT` | `1527` | Port users connect to. `127.0.0.1:1527` accepts connections from this machine only. |
 | `NN_IMAGE` | `ghcr.io/mic-dkfz/nninteractive-server:latest` | Server image. Pin a version tag for reproducible deployments; the tags are listed in the upstream [DOCKER.md](https://github.com/MIC-DKFZ/nnInteractive/blob/master/nnInteractive/inference/server/DOCKER.md). |
 
-Every key is 16 to 128 letters and digits, and no two keys are the same (upper and lower
-case count as the same). `openssl rand -hex 16` makes such a key. The proxy does not
-start while a key breaks these rules; see [Troubleshooting](#troubleshooting).
+Every key is at most 128 letters and digits, and no two keys are the same (upper and lower
+case count as the same). The proxy does not start while a key breaks these rules; see
+[Troubleshooting](#troubleshooting).
+
+> **Warning:** there is no minimum length, but the key is the only thing that keeps others
+> off the GPUs. A short key such as `alice` or `1234` is easy to guess for anyone who can
+> reach `PUBLIC_PORT`. Use short keys only when the port is reachable from trusted machines
+> alone (e.g. `127.0.0.1:1527`, a VPN or a firewalled lab network). Otherwise make every
+> key with `openssl rand -hex 16`.
 
 ### Server options
 
