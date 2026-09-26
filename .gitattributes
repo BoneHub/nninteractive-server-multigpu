@@ -1,0 +1,10 @@
+# Store text files with LF line endings in the repository.
+* text=auto
+
+# Always check these out with LF, also on Windows where core.autocrlf=true
+# would otherwise convert them to CRLF.
+*.yaml        text eol=lf
+*.yml         text eol=lf
+*.conf        text eol=lf
+*.md          text eol=lf
+.env.example  text eol=lf

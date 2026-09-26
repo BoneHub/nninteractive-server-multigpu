@@ -1,0 +1,8 @@
+# Local settings with the real API key: never commit.
+.env
+# Other local copies (.env.bak, .env.old, ...), but keep the template.
+.env.*
+!.env.example
+
+# TLS certificate and key, if you enable HTTPS (see README.md).
+certs/
