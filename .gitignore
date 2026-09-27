@@ -4,5 +4,8 @@
 .env.*
 !.env.example
 
+# Written from .env by configure.sh.
+compose.override.yaml
+
 # TLS certificate and key, if you enable HTTPS (see README.md).
 certs/

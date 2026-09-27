@@ -1,7 +1,8 @@
 #!/bin/sh
 # Entrypoint of the proxy container, see compose.yaml. Checks the keys from .env,
 # writes them into /etc/nginx/users.conf (included by nginx.conf) and starts nginx.
-# A key that breaks the rules stops the proxy with a message naming the key.
+# A key that breaks the rules stops the proxy with a message naming the key, and so
+# does a key without its server container (configure.sh not run after changing .env).
 set -euf
 
 fail() {
@@ -36,16 +37,18 @@ internal=$(lower "$INTERNAL_API_KEY")
 
 nl='
 '
-gpu_map=
 user_map=
+services=
 seen=' '
-total=0
 
 # The number of every GPU<number>_USER_KEYS variable in .env, in order.
 for n in $(env | sed -n 's/^GPU\([0-9][0-9]*\)_USER_KEYS=.*/\1/p' | sort -n); do
+    case $n in
+        0?*) fail "GPU${n}_USER_KEYS: write the GPU number without leading zeros" ;;
+    esac
     eval "keys=\$GPU${n}_USER_KEYS"
     i=0
-    # Keys are separated by commas and/or spaces.
+    # Keys are separated by commas and/or spaces, as in configure.sh.
     for key in $(printf '%s' "$keys" | tr ',' ' '); do
         i=$((i + 1))
         what="key $i in GPU${n}_USER_KEYS"
@@ -56,30 +59,34 @@ for n in $(env | sed -n 's/^GPU\([0-9][0-9]*\)_USER_KEYS=.*/\1/p' | sort -n); do
             *" $key_lower "*) fail "$what appears twice in .env" ;;
         esac
         seen="$seen$key_lower "
-        gpu_map="$gpu_map    \"Bearer $key\" nn$n;$nl"
-        user_map="$user_map    \"Bearer $key\" gpu$n-user$i;$nl"
+        service=gpu$n-user$i
+        services="${services:+$services }$service"
+        user_map="$user_map    \"Bearer $key\" $service;$nl"
     done
-    echo "proxy-start.sh: GPU $n (service nn$n): $i user key(s)"
-    total=$((total + i))
+    echo "proxy-start.sh: GPU $n: $i user key(s)"
 done
-[ "$total" -gt 0 ] || fail "no user keys: set GPU0_USER_KEYS and so on in .env"
+[ -n "$services" ] || fail "no user keys: set GPU0_USER_KEYS and so on in .env"
+
+# Every key needs its server container. configure.sh wrote the list of containers
+# into compose.override.yaml (NN_USER_SERVICES); it is out of date when keys or GPU
+# lines were added to or removed from .env since.
+[ "$services" = "${NN_USER_SERVICES:-}" ] || fail "the server containers do not match the keys in .env.
+  .env needs:            $services
+  compose.override.yaml: ${NN_USER_SERVICES:-(none)}
+Run  docker compose run --rm configure  and then  docker compose up -d --remove-orphans"
 
 umask 077
 cat > /etc/nginx/users.conf <<EOF
 # Written by proxy-start.sh from .env when the proxy started. Do not edit it:
 # change .env and run "docker compose up -d".
 
-# GPU service of each user key; "" for an unknown key.
-map \$http_authorization \$nn_gpu {
-    default "";
-$gpu_map}
-
-# Each user for the log: gpu0-user2 is the 2nd key in GPU0_USER_KEYS.
+# Server container (compose service) of each user key: gpu0-user2 is the 2nd key
+# in GPU0_USER_KEYS; "" for an unknown key.
 map \$http_authorization \$nn_user {
-    default "-";
+    default "";
 $user_map}
 
-# Sent to the GPU containers in place of the user's key.
+# Sent to the server containers in place of the user's key.
 map \$http_authorization \$nn_internal_auth {
     default "Bearer $INTERNAL_API_KEY";
 }
